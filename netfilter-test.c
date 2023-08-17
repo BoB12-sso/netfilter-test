@@ -6,10 +6,15 @@
 #include <netinet/tcp.h>
 #include <linux/types.h>
 #include <libnetfilter_queue/libnetfilter_queue.h>
+
+#include <libnet.h>
 #include <arpa/inet.h>
+#include <errno.h>
 
 #define NF_DROP 0
 #define NF_ACCEPT 1
+
+char* hostname;
 
 void dump(unsigned char* buf, int size) {
     int i;
@@ -27,36 +32,45 @@ static u_int32_t print_pkt(struct nfq_data *tb) {
     return ntohl(ph->packet_id);
 }
 
-static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg,
-              struct nfq_data *nfa, char *hostname) {
+static int cb(struct nfq_q_handle *qh, struct nfgenmsg *nfmsg, 
+                struct nfq_data *nfa, void *data){
+
     u_int32_t id = print_pkt(nfa);
+    unsigned int packetlen;
+    unsigned char *packet;
 
-    int payload_len;
-    unsigned char *payload;
-    if ((payload_len = nfq_get_payload(nfa, &payload)) >= 0) {
-        struct iphdr *ip_header = (struct iphdr *)payload;
-        if (ip_header->protocol == IPPROTO_TCP) {
-            struct tcphdr *tcp_header = (struct tcphdr *)(payload + ip_header->ihl * 4);
-            int tcp_header_len = tcp_header->doff * 4;
-            int total_header_len = ip_header->ihl * 4 + tcp_header_len;
-            if (payload_len > total_header_len + 4 && payload[total_header_len] == 'G' &&
-                payload[total_header_len + 1] == 'E' && payload[total_header_len + 2] == 'T') {
-                char *host = strstr(payload + total_header_len, "Host: ");
-                if (host) {
-                    host += 6;
-                    char *end = strchr(host, '\r');
-                    if (end) {
-                        *end = '\0';
-                        if (strcmp(host, hostname) == 0) {
-                            printf("Blocking packet with id: %u\n", id);
-                            return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
-                        }
-                    }
-                }
-            }
-        }
+    // 패킷 정상적으로 받았는지 확인
+    if((packetlen = nfq_get_payload(nfa, &packet))<=0)
+        return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+    struct libnet_ipv4_hdr* ip_hdr = (struct libnet_ipv4_hdr*)(packet);
+
+    // TCP
+    if(ip_hdr->ip_p != IPPROTO_TCP) // 0x06
+        return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+    struct libnet_tcp_hdr* tcp_hdr = (struct libnet_tcp_hdr*)(packet + ip_hdr->ip_hl*4);
+    unsigned int tcp_hdr_len = tcp_hdr->th_off * 4;
+    unsigned int total_hdr_len = ip_hdr->ip_hl * 4 + tcp_hdr_len;
+
+    // Payload
+    if(!(packetlen>total_hdr_len+4 && packet[total_hdr_len]=='G'&&packet[total_hdr_len+1]=='E'&&packet[total_hdr_len+2]=='T'))
+        return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+
+    char *findhost = strstr((const char *)(packet + total_hdr_len), "Host: ");
+    
+    if(!findhost)
+        return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+
+    findhost+=6; //"Host: "
+    char* hostend = strchr(findhost, '\r');
+    if(!hostend)
+        return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
+    *hostend = '\0';
+
+    // 입력받은 유해사이트와 비교
+    if(strcmp(findhost, hostname)==0){
+        printf("block %s\n", hostname);
+        return nfq_set_verdict(qh, id, NF_DROP, 0, NULL);
     }
-
     return nfq_set_verdict(qh, id, NF_ACCEPT, 0, NULL);
 }
 
@@ -66,6 +80,8 @@ int main(int argc, char *argv[]) {
     int fd;
     int rv;
     char buf[4096] __attribute__ ((aligned));
+
+    hostname = argv[1];
 
     printf("opening library handle\n");
     h = nfq_open();
@@ -87,7 +103,8 @@ int main(int argc, char *argv[]) {
     }
 
     printf("binding this socket to queue '0'\n");
-    qh = nfq_create_queue(h, 0, &cb, argv[1]);
+    qh = nfq_create_queue(h, 0, cb, NULL);
+
     if (!qh) {
         fprintf(stderr, "error during nfq_create_queue()\n");
         exit(1);
@@ -103,14 +120,16 @@ int main(int argc, char *argv[]) {
 
     for (;;) {
         if ((rv = recv(fd, buf, sizeof(buf), 0)) >= 0) {
-            printf("pkt received\n");
             nfq_handle_packet(h, buf, rv);
             continue;
         }
-        if (rv < 0) {
-            perror("recv failed");
-            break;
-        }
+		if (rv < 0 && errno == ENOBUFS) {
+			printf("losing packets!\n");
+			continue;
+		}
+		perror("recv failed");
+		break;
+
     }
 
     printf("unbinding from queue 0\n");
